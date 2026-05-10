@@ -685,31 +685,61 @@ const db=firebase.database();
 function fbRef(path){return db.ref(path);}
 async function fbGet(path){
   try{const snap=await fbRef(path).once('value');return snap.val();}
-  catch(e){console.error('fbGet',path,e);return null;}
+  catch(e){return null;}
 }
 async function fbSet(path,val){
-  try{await fbRef(path).set(val);}
-  catch(e){console.error('fbSet',path,e);}
+  try{await fbRef(path).set(val);}catch(e){}
 }
 async function fbUpdate(path,val){
-  try{await fbRef(path).update(val);}
-  catch(e){console.error('fbUpdate',path,e);}
+  try{await fbRef(path).update(val);}catch(e){}
 }
 async function fbRemove(path){
-  try{await fbRef(path).remove();}
-  catch(e){console.error('fbRemove',path,e);}
+  try{await fbRef(path).remove();}catch(e){}
 }
 function fbOn(path,cb){
   const ref=fbRef(path);ref.on('value',snap=>cb(snap.val()));return ()=>ref.off();
 }
 
-/* ══ USER HELPERS ══ */
-async function getUser(u){return await fbGet('users/'+u.toLowerCase());}
-async function setUser(u,d){await fbSet('users/'+u.toLowerCase(),d);}
-async function deleteUser(u){await fbRemove('users/'+u.toLowerCase());}
+/* ══ LOCAL CACHE (instant reads, background Firebase sync) ══ */
+const CACHE_KEY='sbs_cache_v1';
+function cacheGet(u){
+  try{const c=JSON.parse(localStorage.getItem(CACHE_KEY)||'{}');return c[u.toLowerCase()]||null;}catch(e){return null;}
+}
+function cacheSet(u,d){
+  try{const c=JSON.parse(localStorage.getItem(CACHE_KEY)||'{}');c[u.toLowerCase()]=d;localStorage.setItem(CACHE_KEY,JSON.stringify(c));}catch(e){}
+}
+function cacheDel(u){
+  try{const c=JSON.parse(localStorage.getItem(CACHE_KEY)||'{}');delete c[u.toLowerCase()];localStorage.setItem(CACHE_KEY,JSON.stringify(c));}catch(e){}
+}
+
+/* ══ USER HELPERS (cache-first) ══ */
+async function getUser(u){
+  // Return cached instantly; fetch from Firebase in background to keep fresh
+  const cached=cacheGet(u);
+  if(cached){
+    // Background refresh — don't await
+    fbGet('users/'+u.toLowerCase()).then(fresh=>{if(fresh)cacheSet(u,fresh);});
+    return cached;
+  }
+  // No cache — must fetch from Firebase
+  const d=await fbGet('users/'+u.toLowerCase());
+  if(d)cacheSet(u,d);
+  return d;
+}
+async function setUser(u,d){
+  cacheSet(u,d); // instant local write
+  fbSet('users/'+u.toLowerCase(),d); // async Firebase write (don't await)
+}
+async function deleteUser(u){
+  cacheDel(u);
+  fbRemove('users/'+u.toLowerCase());
+}
 async function getAllUsers(){
+  // For leaderboard: fetch fresh from Firebase (accuracy matters more than speed here)
   const all=await fbGet('users');
   if(!all)return[];
+  // Also update cache while we're at it
+  Object.entries(all).forEach(([k,v])=>cacheSet(k,v));
   return Object.entries(all).map(([k,v])=>({username:k,...v}));
 }
 function sh(s){let h=0;for(let i=0;i<s.length;i++)h=(Math.imul(31,h)+s.charCodeAt(i))|0;return h.toString(36);}
@@ -819,22 +849,41 @@ async function doLogin(){
   if(!rawU||!rawP){setMsg('Fill in all fields.','err');return;}
   if(rawU.length<2){setMsg('Username min 2 chars.','err');return;}
   const u=rawU.toLowerCase();
-  const btn=document.getElementById('li-btn');btn.disabled=true;setMsg('Connecting...','');
-  try{
-    if(loginTab==='register'){
-      const existing=await getUser(u);
-      if(existing){setMsg('Username taken.','err');btn.disabled=false;return;}
-      const d={bux:0,tokens:0,owned:[],equipped:null,wins:0,winstreak:0,rp:0,rankId:'bronze',passHash:sh(rawP),displayName:rawU};
-      await setUser(u,d);
-      setMsg('Account created!','ok');
-      setTimeout(()=>{btn.disabled=false;completeLogin(u,d);},500);
-    } else {
-      const d=await getUser(u);
-      if(!d){setMsg('User not found.','err');btn.disabled=false;return;}
+  const btn=document.getElementById('li-btn');btn.disabled=true;
+
+  if(loginTab==='register'){
+    // Check locally only — instant
+    if(cacheGet(u)){setMsg('Username taken (locally).','err');btn.disabled=false;return;}
+    const d={bux:0,tokens:0,owned:[],equipped:null,wins:0,winstreak:0,rp:0,rankId:'bronze',passHash:sh(rawP),displayName:rawU};
+    cacheSet(u,d);
+    fbSet('users/'+u,d); // fire-and-forget
+    btn.disabled=false;
+    completeLogin(u,d); // instant
+  } else {
+    // Try local cache — zero network
+    const d=cacheGet(u);
+    if(d){
       if(d.passHash!==sh(rawP)){setMsg('Wrong password.','err');btn.disabled=false;return;}
-      btn.disabled=false;completeLogin(u,d);
+      btn.disabled=false;
+      completeLogin(u,d);
+      fbGet('users/'+u).then(f=>{if(f){cacheSet(u,f);}}).catch(()=>{});
+    } else {
+      // First time on this device — one Firebase fetch, show spinner
+      setMsg('First login — fetching...','');
+      try{
+        const f=await Promise.race([
+          fbGet('users/'+u),
+          new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),6000))
+        ]);
+        if(!f){setMsg('Not found. Register first.','err');btn.disabled=false;return;}
+        if(f.passHash!==sh(rawP)){setMsg('Wrong password.','err');btn.disabled=false;return;}
+        cacheSet(u,f);btn.disabled=false;completeLogin(u,f);
+      }catch(e){
+        setMsg(e.message==='timeout'?'Slow connection — try again.':'Error: '+e.message,'err');
+        btn.disabled=false;
+      }
     }
-  }catch(e){setMsg('Connection error. Check internet.','err');btn.disabled=false;}
+  }
 }
 
 function completeLogin(username,data){
@@ -851,10 +900,10 @@ function completeLogin(username,data){
   showScreen('menu-screen');menuRain.start();
 }
 function logout(){saveCU();CU=null;autoWin=false;adminUnlocked=false;closeAdmin();cancelOnlineLobby();document.getElementById('li-user').value='';document.getElementById('li-pass').value='';setMsg('','');showScreen('login-screen');loginRain.start();}
-async function saveCU(){
+function saveCU(){
   if(!CU)return;
   const{username,...d}=CU;d.cfg=cfg;
-  await setUser(username,d);
+  setUser(username,d); // cache-first: instant local, async Firebase
 }
 function updateMenuRankChip(){
   if(!CU)return;
