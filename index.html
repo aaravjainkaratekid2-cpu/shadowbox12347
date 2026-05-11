@@ -439,7 +439,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;heigh
     </div>
     <div class="ol-panel" id="ol-join-panel">
       <div class="ol-sub">Enter your opponent's code:</div>
-      <input class="ol-inp" id="ol-join-inp" placeholder="XXXX" maxlength="4">
+      <input class="ol-inp" id="ol-join-inp" placeholder="1234" maxlength="4" inputmode="numeric" oninput="this.value=this.value.replace(/\D/g,'')">
       <button class="ol-btn" id="ol-join-btn" onclick="joinOnlineGame()">Join</button>
       <div class="ol-status" id="ol-join-status"></div>
     </div>
@@ -685,61 +685,31 @@ const db=firebase.database();
 function fbRef(path){return db.ref(path);}
 async function fbGet(path){
   try{const snap=await fbRef(path).once('value');return snap.val();}
-  catch(e){return null;}
+  catch(e){console.error('fbGet',path,e);return null;}
 }
 async function fbSet(path,val){
-  try{await fbRef(path).set(val);}catch(e){}
+  try{await fbRef(path).set(val);}
+  catch(e){console.error('fbSet',path,e);}
 }
 async function fbUpdate(path,val){
-  try{await fbRef(path).update(val);}catch(e){}
+  try{await fbRef(path).update(val);}
+  catch(e){console.error('fbUpdate',path,e);}
 }
 async function fbRemove(path){
-  try{await fbRef(path).remove();}catch(e){}
+  try{await fbRef(path).remove();}
+  catch(e){console.error('fbRemove',path,e);}
 }
 function fbOn(path,cb){
   const ref=fbRef(path);ref.on('value',snap=>cb(snap.val()));return ()=>ref.off();
 }
 
-/* ══ LOCAL CACHE (instant reads, background Firebase sync) ══ */
-const CACHE_KEY='sbs_cache_v1';
-function cacheGet(u){
-  try{const c=JSON.parse(localStorage.getItem(CACHE_KEY)||'{}');return c[u.toLowerCase()]||null;}catch(e){return null;}
-}
-function cacheSet(u,d){
-  try{const c=JSON.parse(localStorage.getItem(CACHE_KEY)||'{}');c[u.toLowerCase()]=d;localStorage.setItem(CACHE_KEY,JSON.stringify(c));}catch(e){}
-}
-function cacheDel(u){
-  try{const c=JSON.parse(localStorage.getItem(CACHE_KEY)||'{}');delete c[u.toLowerCase()];localStorage.setItem(CACHE_KEY,JSON.stringify(c));}catch(e){}
-}
-
-/* ══ USER HELPERS (cache-first) ══ */
-async function getUser(u){
-  // Return cached instantly; fetch from Firebase in background to keep fresh
-  const cached=cacheGet(u);
-  if(cached){
-    // Background refresh — don't await
-    fbGet('users/'+u.toLowerCase()).then(fresh=>{if(fresh)cacheSet(u,fresh);});
-    return cached;
-  }
-  // No cache — must fetch from Firebase
-  const d=await fbGet('users/'+u.toLowerCase());
-  if(d)cacheSet(u,d);
-  return d;
-}
-async function setUser(u,d){
-  cacheSet(u,d); // instant local write
-  fbSet('users/'+u.toLowerCase(),d); // async Firebase write (don't await)
-}
-async function deleteUser(u){
-  cacheDel(u);
-  fbRemove('users/'+u.toLowerCase());
-}
+/* ══ USER HELPERS ══ */
+async function getUser(u){return await fbGet('users/'+u.toLowerCase());}
+async function setUser(u,d){await fbSet('users/'+u.toLowerCase(),d);}
+async function deleteUser(u){await fbRemove('users/'+u.toLowerCase());}
 async function getAllUsers(){
-  // For leaderboard: fetch fresh from Firebase (accuracy matters more than speed here)
   const all=await fbGet('users');
   if(!all)return[];
-  // Also update cache while we're at it
-  Object.entries(all).forEach(([k,v])=>cacheSet(k,v));
   return Object.entries(all).map(([k,v])=>({username:k,...v}));
 }
 function sh(s){let h=0;for(let i=0;i<s.length;i++)h=(Math.imul(31,h)+s.charCodeAt(i))|0;return h.toString(36);}
@@ -849,41 +819,21 @@ async function doLogin(){
   if(!rawU||!rawP){setMsg('Fill in all fields.','err');return;}
   if(rawU.length<2){setMsg('Username min 2 chars.','err');return;}
   const u=rawU.toLowerCase();
-  const btn=document.getElementById('li-btn');btn.disabled=true;
-
-  if(loginTab==='register'){
-    // Check locally only — instant
-    if(cacheGet(u)){setMsg('Username taken (locally).','err');btn.disabled=false;return;}
-    const d={bux:0,tokens:0,owned:[],equipped:null,wins:0,winstreak:0,rp:0,rankId:'bronze',passHash:sh(rawP),displayName:rawU};
-    cacheSet(u,d);
-    fbSet('users/'+u,d); // fire-and-forget
-    btn.disabled=false;
-    completeLogin(u,d); // instant
-  } else {
-    // Try local cache — zero network
-    const d=cacheGet(u);
-    if(d){
-      if(d.passHash!==sh(rawP)){setMsg('Wrong password.','err');btn.disabled=false;return;}
-      btn.disabled=false;
-      completeLogin(u,d);
-      fbGet('users/'+u).then(f=>{if(f){cacheSet(u,f);}}).catch(()=>{});
+  const btn=document.getElementById('li-btn');btn.disabled=true;setMsg('Connecting...','');
+  try{
+    if(loginTab==='register'){
+      const existing=await getUser(u);
+      if(existing){setMsg('Username taken.','err');btn.disabled=false;return;}
+      const d={bux:0,tokens:0,owned:[],equipped:null,wins:0,winstreak:0,rp:0,rankId:'bronze',passHash:sh(rawP),displayName:rawU};
+      await setUser(u,d);
+      btn.disabled=false;completeLogin(u,d);
     } else {
-      // First time on this device — one Firebase fetch, show spinner
-      setMsg('First login — fetching...','');
-      try{
-        const f=await Promise.race([
-          fbGet('users/'+u),
-          new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),6000))
-        ]);
-        if(!f){setMsg('Not found. Register first.','err');btn.disabled=false;return;}
-        if(f.passHash!==sh(rawP)){setMsg('Wrong password.','err');btn.disabled=false;return;}
-        cacheSet(u,f);btn.disabled=false;completeLogin(u,f);
-      }catch(e){
-        setMsg(e.message==='timeout'?'Slow connection — try again.':'Error: '+e.message,'err');
-        btn.disabled=false;
-      }
+      const d=await getUser(u);
+      if(!d){setMsg('User not found.','err');btn.disabled=false;return;}
+      if(d.passHash!==sh(rawP)){setMsg('Wrong password.','err');btn.disabled=false;return;}
+      btn.disabled=false;completeLogin(u,d);
     }
-  }
+  }catch(e){setMsg('Connection error. Check internet.','err');btn.disabled=false;}
 }
 
 function completeLogin(username,data){
@@ -900,10 +850,10 @@ function completeLogin(username,data){
   showScreen('menu-screen');menuRain.start();
 }
 function logout(){saveCU();CU=null;autoWin=false;adminUnlocked=false;closeAdmin();cancelOnlineLobby();document.getElementById('li-user').value='';document.getElementById('li-pass').value='';setMsg('','');showScreen('login-screen');loginRain.start();}
-function saveCU(){
+async function saveCU(){
   if(!CU)return;
   const{username,...d}=CU;d.cfg=cfg;
-  setUser(username,d); // cache-first: instant local, async Firebase
+  await setUser(username,d);
 }
 function updateMenuRankChip(){
   if(!CU)return;
@@ -1075,8 +1025,15 @@ function findRankedMatch(){if(rankedMode==='ai')startGame('ranked');else openOnl
 function openOnlineLobby(isRanked){
   onlineIsRanked=isRanked;
   document.getElementById('ol-title').textContent=isRanked?'🏆 Ranked Online':'🥊 Online Multiplayer';
+  document.getElementById('ol-join-inp').value='';
+  document.getElementById('ol-join-status').textContent='';
+  document.getElementById('ol-join-status').style.color='';
+  document.getElementById('ol-join-btn').disabled=false;
+  onlineCode=null; // force fresh room
   document.getElementById('online-lobby').classList.add('open');
-  switchOLTab('host');
+  // Always activate host tab on open
+  ['host','join'].forEach(id=>{document.getElementById('olt-'+id).classList.toggle('active',id==='host');document.getElementById('ol-'+id+'-panel').classList.toggle('active',id==='host');});
+  hostOnlineGame();
 }
 function cancelOnlineLobby(){
   document.getElementById('online-lobby').classList.remove('open');
@@ -1084,10 +1041,20 @@ function cancelOnlineLobby(){
   if(onlineCode&&onlineRole==='host')fbRemove('rooms/'+onlineCode);
   onlineCode=null;onlineRole=null;
   document.getElementById('ol-join-btn').disabled=false;
+  document.getElementById('ol-join-inp').value='';
+  document.getElementById('ol-join-status').textContent='';
+  document.getElementById('ol-join-status').style.color='';
+  document.getElementById('ol-host-status').textContent='Waiting for opponent...';
+  document.getElementById('ol-host-status').style.color='var(--muted)';
 }
 function switchOLTab(t){
   ['host','join'].forEach(id=>{document.getElementById('olt-'+id).classList.toggle('active',id===t);document.getElementById('ol-'+id+'-panel').classList.toggle('active',id===t);});
-  if(t==='host')hostOnlineGame();
+  if(t==='join'){
+    document.getElementById('ol-join-status').textContent='';
+    document.getElementById('ol-join-status').style.color='';
+    document.getElementById('ol-join-btn').disabled=false;
+  }
+  if(t==='host'&&!onlineCode)hostOnlineGame();
 }
 function hostOnlineGame(){
   // Clean up previous room
@@ -1130,15 +1097,37 @@ async function joinOnlineGame(){
 async function launchOnlineGame(code,role){
   const mode=onlineIsRanked?'ranked_online':'online';
   if(role==='host'){
-    await fbSet('games/'+code,{attacker:'p1',p1hits:0,p2hits:0,p1choice:null,p2choice:null,phase:'choosing',ts:Date.now()});
+    await fbSet('games/'+code,{attacker:'p1',p1hits:0,p2hits:0,p1choice:null,p2choice:null,phase:'choosing',resolved:false,ts:Date.now()});
   }
+  // Store before startGame resets G
+  const myName=CU.displayName||CU.username;
+  const oppName=onlineOpponent;
   startGame(mode);
+  // Restore online fields after startGame reset G
   G.onlineCode=code;G.onlineRole=role;
-  G.p1n=CU.displayName||CU.username;G.p2n=onlineOpponent;
+  // We always show local player as P1 slot, opponent as P2 slot
+  G.p1n=myName;G.p2n=oppName;
   ['hn1','fn1'].forEach(id=>document.getElementById(id).textContent=G.p1n);
   ['hn2','fn2'].forEach(id=>document.getElementById(id).textContent=G.p2n);
   document.getElementById('av1').textContent=G.p1n.slice(0,2).toUpperCase();
   document.getElementById('av2').textContent=G.p2n.slice(0,2).toUpperCase();
+
+  if(role==='guest'){
+    // Guest: sync initial attacker from Firebase before first round
+    const gs=await fbGet('games/'+code);
+    if(gs){
+      // attacker 'p1' means host attacks; from guest perspective, host is our P2 slot → local attacker=2
+      G.attacker=gs.attacker==='p1'?2:1;
+      G.p1hits=gs.p2hits||0; // guest's hits are stored as p2hits
+      G.p2hits=gs.p1hits||0; // host's hits are p1hits
+    }
+    updateHUD();
+    G._guestSynced=true;
+    beginRound();
+  } else {
+    // Host is always attacker first (G.attacker=1 already set)
+    beginRound();
+  }
 }
 
 /* ══ LEADERBOARD ══ */
@@ -1222,7 +1211,11 @@ function quitGame(){
   clearTimers();if(gameUnsub){gameUnsub();gameUnsub=null;}
   phase='idle';hideOverlay();hideFinPicker();hideDirPicker();
   document.getElementById('fin-overlay').classList.remove('show');
-  if(G.onlineCode){fbRemove('games/'+G.onlineCode);fbRemove('rooms/'+G.onlineCode);}
+  if(G.onlineCode){
+    fbUpdate('games/'+G.onlineCode,{quit:CU?.username||'opponent'}).then(()=>{
+      fbRemove('games/'+G.onlineCode);fbRemove('rooms/'+G.onlineCode);
+    });
+  }
   showScreen('menu-screen');
 }
 
@@ -1242,12 +1235,34 @@ function startGame(mode){
   document.getElementById('av1').textContent=G.p1n.slice(0,2).toUpperCase();
   document.getElementById('av2').textContent=G.p2n.slice(0,2).toUpperCase();
   document.getElementById('ctrl2').style.display=mode==='local'?'flex':'none';
-  showScreen('game-screen');updateHUD();beginRound();
+  showScreen('game-screen');updateHUD();
+  // For online modes, launchOnlineGame handles beginRound after Firebase setup
+  if(!isOnlineMode())beginRound();
 }
 
 function beginRound(){
   phase='choosing';pendingFin=null;G.p1c=null;G.p2c=null;
   clearBtns();hideOverlay();hideFinPicker();hideDirPicker();resetDDs();
+
+  // For guest: sync attacker from Firebase before rendering (but skip if called from listener which already synced)
+  if(isOnlineMode()&&G.onlineRole==='guest'&&G.onlineCode&&!G._guestSynced){
+    fbGet('games/'+G.onlineCode).then(state=>{
+      if(state){
+        const fbAtkIsHost=state.attacker==='p1';
+        G.attacker=fbAtkIsHost?2:1;
+        G.p1hits=state.p2hits||0;
+        G.p2hits=state.p1hits||0;
+      }
+      G._guestSynced=false;
+      _doBeginRound();
+    });
+    return;
+  }
+  G._guestSynced=false;
+  _doBeginRound();
+}
+
+function _doBeginRound(){
   const an=G.attacker===1?G.p1n:G.p2n,dn=G.attacker===1?G.p2n:G.p1n;
   document.getElementById('aprompt').textContent=an+' attacking — '+dn+' dodge!';
   setAR('av1',G.attacker===1?'atk':'dod');setAR('av2',G.attacker===2?'atk':'dod');
@@ -1257,6 +1272,7 @@ function beginRound(){
   document.getElementById('hr1').textContent=r1?'Attacker':'Dodger';document.getElementById('hr1').className='hp-role '+(r1?'role-atk':'role-dod');
   document.getElementById('hr2').textContent=r1?'Dodger':'Attacker';document.getElementById('hr2').className='hp-role '+(r1?'role-dod':'role-atk');
   applyDodgeGrey();enableGrid('dg1',true);enableGrid('dg2',G.mode==='local');
+  updateHUD();
 
   if(autoWin&&G.attacker===1){startTimer();aiTO=setTimeout(()=>{if(phase!=='choosing')return;resolveRound('up',null);},200);return;}
 
@@ -1277,7 +1293,7 @@ function applyDodgeGrey(){
   const b=G.lastDodgeDir;
   document.querySelectorAll('#dg1 .dbtn:not(.empty)').forEach(btn=>{const sg=btn.dataset.dir===b;btn.classList.toggle('greyed',sg);if(sg)btn.disabled=true;});
 }
-function recordAIAttack(dir){G.p2c=dir;document.getElementById('dd2').textContent='✓';document.getElementById('dd2').className='dd chosen';enableGrid('dg1',true);applyDodgeGrey();document.getElementById('aprompt').textContent='AI attacked! Dodge!';}
+function recordAIAttack(dir){G.p2c=dir;document.getElementById('dd2').textContent='✓';document.getElementById('dd2').className='dd chosen';enableGrid('dg1',true);applyDodgeGrey();document.getElementById('aprompt').textContent=G.p2n+' attacked! Pick your dodge!';}
 function startTimer(){phase='choosing';let rem=TIMER_MS;clearInterval(tInt);tInt=setInterval(()=>{rem-=50;if(rem<=0){clearInterval(tInt);onTimeout();}},50);}
 function onTimeout(){if(phase!=='choosing')return;resolveRound(G.p1c,G.p2c);}
 
@@ -1285,28 +1301,80 @@ function onTimeout(){if(phase!=='choosing')return;resolveRound(G.p1c,G.p2c);}
 function listenOnlineGame(){
   if(!G.onlineCode)return;
   if(gameUnsub){gameUnsub();gameUnsub=null;}
+  const isHost=G.onlineRole==='host';
+  // In Firebase: p1 = host, p2 = guest
+  // Locally on each screen: p1 slot = "me", p2 slot = "opponent"
+  const myFbField=isHost?'p1choice':'p2choice';
+  const oppFbField=isHost?'p2choice':'p1choice';
+
   gameUnsub=fbOn('games/'+G.onlineCode,(state)=>{
-    if(!state||phase==='result')return;
-    // Determine my choice field and opponent's
-    const myField=G.onlineRole==='host'?'p1choice':'p2choice';
-    const oppField=G.onlineRole==='host'?'p2choice':'p1choice';
-    const oppChoice=state[oppField];
+    if(!state){
+      // Game was deleted — opponent quit
+      if(phase!=='idle'){
+        if(gameUnsub){gameUnsub();gameUnsub=null;}
+        clearTimers();phase='idle';
+        hideOverlay();hideFinPicker();hideDirPicker();
+        document.getElementById('fin-overlay').classList.remove('show');
+        showOverlay('OPPONENT QUIT','Returning to menu...','var(--muted)');
+        setTimeout(()=>{hideOverlay();showScreen('menu-screen');},2000);
+      }
+      return;
+    }
+
+    if(phase==='result'){
+      // Guest watches for host to reset (resolved→false) signaling next round ready
+      if(!isHost&&state.resolved===false&&state.p1choice===null&&state.p2choice===null){
+        // Sync new attacker and hits from Firebase for guest
+        const fbAtkIsHost=state.attacker==='p1';
+        G.attacker=fbAtkIsHost?2:1;
+        G.p1hits=state.p2hits||0; // guest's hits = p2hits in Firebase
+        G.p2hits=state.p1hits||0; // host's hits = p1hits
+        G._guestSynced=true; // skip redundant fbGet in beginRound
+        if(gameUnsub){gameUnsub();gameUnsub=null;}
+        beginRound();
+      }
+      return;
+    }
+
+    if(phase!=='choosing')return;
+
+    const oppChoice=state[oppFbField];
     if(oppChoice&&!G.p2c){
       G.p2c=oppChoice;
-      document.getElementById('dd2').textContent='✓';document.getElementById('dd2').className='dd chosen';
-      if(G.p1c){if(gameUnsub){gameUnsub();gameUnsub=null;}clearInterval(tInt);resolveRound(G.p1c,G.p2c);}
+      document.getElementById('dd2').textContent='✓';
+      document.getElementById('dd2').className='dd chosen';
+      if(G.p1c){
+        if(gameUnsub){gameUnsub();gameUnsub=null;}
+        clearInterval(tInt);
+        resolveRound(G.p1c,G.p2c);
+      }
     }
   });
 }
 async function submitOnlineChoice(dir){
   if(!G.onlineCode)return;
-  const myField=G.onlineRole==='host'?'p1choice':'p2choice';
-  const upd={};upd[myField]=dir;upd['ts']=Date.now();
+  const isHost=G.onlineRole==='host';
+  // Determine which Firebase field we write to based on role
+  // BUT also based on whether we are the attacker or dodger this round
+  // Host=p1 in Firebase, Guest=p2 in Firebase — always
+  const myFbField=isHost?'p1choice':'p2choice';
+  const upd={};upd[myFbField]=dir;upd['ts']=Date.now();
   await fbUpdate('games/'+G.onlineCode,upd);
 }
 async function resetOnlineGame(){
-  if(!G.onlineCode)return;
-  await fbSet('games/'+G.onlineCode,{attacker:G.attacker===1?'p1':'p2',p1hits:G.p1hits,p2hits:G.p2hits,p1choice:null,p2choice:null,phase:'choosing',ts:Date.now()});
+  if(!G.onlineCode||G.onlineRole!=='host')return; // Only host resets game state
+  // Host is always p1 in Firebase, guest is p2
+  // G.p1hits = local player (host) hits, G.p2hits = opponent (guest) hits
+  const fbAttacker=G.attacker===1?'p1':'p2'; // host local attacker=1 means p1 attacks in Firebase
+  await fbSet('games/'+G.onlineCode,{
+    attacker:fbAttacker,
+    p1hits:G.p1hits,  // host's hits
+    p2hits:G.p2hits,  // guest's hits
+    p1choice:null,p2choice:null,
+    phase:'choosing',
+    resolved:false,
+    ts:Date.now()
+  });
 }
 
 /* ── FINISHER PICKER ── */
@@ -1335,11 +1403,18 @@ function recordChoice(p,dir){
     const isFin=pendingFin&&pendingFin.dir===dir;
     document.getElementById('dd'+p).textContent=isFin?'★':'✓';document.getElementById('dd'+p).className='dd '+(isFin?'finisher':'chosen');
     enableGrid('dg'+p,false);
-    if(isOnlineMode())submitOnlineChoice(dir);
+    if(isOnlineMode()){
+      submitOnlineChoice(dir); // Submit to Firebase; listener will detect opponent's choice
+    }
     else if(isAIMode()){aiTO=setTimeout(()=>{if(phase!=='choosing')return;const d=aiDodge(dir,G.diff);G.p2c=d;document.querySelectorAll('#dg2 .dbtn').forEach(b=>{if(b.dataset.dir===d)b.classList.add('sel-dod');});clearInterval(tInt);resolveRound(G.p1c,G.p2c);},aiDodgeDelay());}
   } else if(p!==G.attacker&&G.attacker===2){
-    if(isOnlineMode())submitOnlineChoice(dir);
-    if(gameUnsub){gameUnsub();gameUnsub=null;}clearInterval(tInt);resolveRound(G.p1c,G.p2c);return;
+    if(isOnlineMode()){
+      submitOnlineChoice(dir); // Submit dodge to Firebase
+      // Listener will fire when host (attacker) also submits
+    } else {
+      if(gameUnsub){gameUnsub();gameUnsub=null;}clearInterval(tInt);resolveRound(G.p1c,G.p2c);
+    }
+    return;
   }
   if(G.mode==='local'){const ac=G.attacker===1?G.p1c:G.p2c,dc=G.attacker===1?G.p2c:G.p1c;if(ac&&dc){clearInterval(tInt);resolveRound(G.p1c,G.p2c);}}
 }
@@ -1359,7 +1434,8 @@ function resolveRound(p1c,p2c){
   revealDD(1,p1c,usedFin&&G.attacker===1);revealDD(2,p2c,usedFin&&G.attacker===2);
   let big='',sub='',hit=false;
   if(isBoom){big='WE BRING THE BOOM!!';sub='Instant knockout!';hit=true;}
-  else if(!ac){big='TIME OUT';sub='Attacker too slow — roles swap!';hit=false;}
+  else if(!ac&&!dc){big='TIME OUT';sub='Nobody moved — roles swap!';hit=false;}
+  else if(!ac){big='TIME OUT';sub=an+' was too slow — roles swap!';hit=false;}
   else if(!dc||ac===dc){big=usedFin?'FINISHER!':'HIT!';sub=(usedFin?usedFin.name+' — ':'')+an+' lands the punch!';hit=true;}
   else{big='DODGED!';sub=dn+' slips away!';hit=false;}
   const col=hit?(usedFin?'var(--gold)':'var(--red)'):'#7b93ff';
@@ -1378,7 +1454,14 @@ function resolveRound(p1c,p2c){
   }
   pendingFin=null;updateHUD();
   // Reset online game state for next round
-  if(isOnlineMode()&&G.onlineCode)resetOnlineGame();
+  if(isOnlineMode()&&G.onlineCode){
+    if(G.onlineRole==='host'){
+      // Mark resolved so guest knows result happened, then after delay write fresh round state
+      fbUpdate('games/'+G.onlineCode,{resolved:true}).then(()=>{
+        setTimeout(()=>resetOnlineGame(),400);
+      });
+    }
+  }
   const over=G.p1hits>=WINS||G.p2hits>=WINS;
   if(hit&&usedFin){rTO=setTimeout(()=>{hideOverlay();if(isBoom)showBoom(()=>{updateHUD();rTO=setTimeout(()=>over?endMatch():beginRound(),400);});else showFinCinematic(usedFin,()=>{updateHUD();rTO=setTimeout(()=>over?endMatch():beginRound(),400);});},400);}
   else{rTO=setTimeout(()=>{if(!hit&&G.attacker===2)G.lastDodgeDir=null;over?endMatch():beginRound();},1700);}
@@ -1418,9 +1501,9 @@ async function endMatch(){
   document.getElementById('gs1').textContent=G.p1hits;document.getElementById('gs2').textContent=G.p2hits;
   let buxMsg='',tokMsg='',rpMsg='',promotedRank=null;
   if(CU){
-    if(p1won){CU.wins=(CU.wins||0)+1;CU.winstreak=(CU.winstreak||0)+1;}else CU.winstreak=0;
-    if(G.mode==='xtreme'){if(p1won){CU.tokens=(CU.tokens||0)+5;tokMsg='+5 Tokens! 🪙';}else tokMsg='No tokens.';}
-    else if(G.mode==='ai'){const e={1:5,2:7,3:10}[cfg.diff]||5;CU.bux=(CU.bux||0)+e;buxMsg='+'+e+' BoxBux! 💰';}
+    if(p1won){CU.wins=(CU.wins||0)+1;CU.winstreak=(CU.winstreak||0)+1;}else{CU.winstreak=0;}
+    if(G.mode==='xtreme'){if(p1won){CU.tokens=(CU.tokens||0)+5;tokMsg='+5 Tokens! 🪙';}else tokMsg='No tokens — try again!';}
+    else if(G.mode==='ai'){if(p1won){const e={1:5,2:7,3:10}[cfg.diff]||5;CU.bux=(CU.bux||0)+e;buxMsg='+'+e+' BoxBux! 💰';}else buxMsg='No bux — better luck next time!';}
     else if(G.isRanked){
       const rpChange=p1won?10:-5;CU.rp=(CU.rp||0)+rpChange;
       if(rpChange>0)promotedRank=checkRankUp(CU);else checkRankDown(CU);
@@ -1441,8 +1524,11 @@ async function endMatch(){
   if(promotedRank)setTimeout(()=>showRankUpModal(promotedRank,()=>{}),600);
 }
 function rematch(){
-  if(G.mode==='xtreme'){if(!CU||CU.bux<5){alert('Need 5 BoxBux!');showScreen('menu-screen');return;}CU.bux-=5;saveCU();}
-  if(isOnlineMode()){showRanked();return;}
+  if(G.mode==='xtreme'){
+    if(!CU||CU.bux<5){showScreen('menu-screen');return;}
+    CU.bux-=5;saveCU();startGame('xtreme');return;
+  }
+  if(isOnlineMode()){showScreen('menu-screen');return;}
   startGame(G.mode);
 }
 
