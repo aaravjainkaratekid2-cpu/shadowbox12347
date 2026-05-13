@@ -1095,17 +1095,43 @@ async function joinOnlineGame(){
   setTimeout(()=>{document.getElementById('online-lobby').classList.remove('open');launchOnlineGame(code,'guest');},900);
 }
 async function launchOnlineGame(code,role){
+  /*
+   * ONLINE PROTOCOL (clean, simple):
+   *
+   * Firebase /games/<code> structure:
+   *   hostChoice   : null | 'up'|'down'|'left'|'right'
+   *   guestChoice  : null | 'up'|'down'|'left'|'right'
+   *   hostHits     : number
+   *   guestHits    : number
+   *   attacker     : 'host' | 'guest'
+   *   round        : number  (increments each round so listener always fires)
+   *   outcome      : null | {winner:'host'|'guest'|'none', hostHits, guestHits, nextAttacker:'host'|'guest'}
+   *
+   * HOST resolves every round (single source of truth):
+   *   - Both players write their choice (hostChoice / guestChoice)
+   *   - Host listener sees both choices present → resolves → writes outcome + increments round
+   *   - Both players listen: when outcome appears → show result → beginRound
+   *   - Host also writes next round state (clears choices, sets attacker)
+   *
+   * GUEST just writes choice and waits for outcome.
+   */
   const mode=onlineIsRanked?'ranked_online':'online';
-  if(role==='host'){
-    await fbSet('games/'+code,{attacker:'p1',p1hits:0,p2hits:0,p1choice:null,p2choice:null,phase:'choosing',resolved:false,ts:Date.now()});
-  }
-  // Store before startGame resets G
   const myName=CU.displayName||CU.username;
   const oppName=onlineOpponent;
+
+  if(role==='host'){
+    await fbSet('games/'+code,{
+      hostChoice:null,guestChoice:null,
+      hostHits:0,guestHits:0,
+      attacker:'host',
+      round:1,
+      outcome:null,
+      ts:Date.now()
+    });
+  }
+
   startGame(mode);
-  // Restore online fields after startGame reset G
   G.onlineCode=code;G.onlineRole=role;
-  // We always show local player as P1 slot, opponent as P2 slot
   G.p1n=myName;G.p2n=oppName;
   ['hn1','fn1'].forEach(id=>document.getElementById(id).textContent=G.p1n);
   ['hn2','fn2'].forEach(id=>document.getElementById(id).textContent=G.p2n);
@@ -1113,21 +1139,18 @@ async function launchOnlineGame(code,role){
   document.getElementById('av2').textContent=G.p2n.slice(0,2).toUpperCase();
 
   if(role==='guest'){
-    // Guest: sync initial attacker from Firebase before first round
+    // Guest waits for host to write initial game state
     const gs=await fbGet('games/'+code);
     if(gs){
-      // attacker 'p1' means host attacks; from guest perspective, host is our P2 slot → local attacker=2
-      G.attacker=gs.attacker==='p1'?2:1;
-      G.p1hits=gs.p2hits||0; // guest's hits are stored as p2hits
-      G.p2hits=gs.p1hits||0; // host's hits are p1hits
+      // attacker:'host' means host attacks = local P2 attacks from guest view
+      G.attacker = gs.attacker==='host' ? 2 : 1;
+      G.p1hits = gs.guestHits||0;
+      G.p2hits = gs.hostHits||0;
+      updateHUD();
     }
-    updateHUD();
-    G._guestSynced=true;
-    beginRound();
-  } else {
-    // Host is always attacker first (G.attacker=1 already set)
-    beginRound();
   }
+  // attacker is already 1 for host (default in startGame)
+  beginRound();
 }
 
 /* ══ LEADERBOARD ══ */
@@ -1212,9 +1235,7 @@ function quitGame(){
   phase='idle';hideOverlay();hideFinPicker();hideDirPicker();
   document.getElementById('fin-overlay').classList.remove('show');
   if(G.onlineCode){
-    fbUpdate('games/'+G.onlineCode,{quit:CU?.username||'opponent'}).then(()=>{
-      fbRemove('games/'+G.onlineCode);fbRemove('rooms/'+G.onlineCode);
-    });
+    try{fbRemove('games/'+G.onlineCode);fbRemove('rooms/'+G.onlineCode);}catch(e){}
   }
   showScreen('menu-screen');
 }
@@ -1243,22 +1264,6 @@ function startGame(mode){
 function beginRound(){
   phase='choosing';pendingFin=null;G.p1c=null;G.p2c=null;
   clearBtns();hideOverlay();hideFinPicker();hideDirPicker();resetDDs();
-
-  // For guest: sync attacker from Firebase before rendering (but skip if called from listener which already synced)
-  if(isOnlineMode()&&G.onlineRole==='guest'&&G.onlineCode&&!G._guestSynced){
-    fbGet('games/'+G.onlineCode).then(state=>{
-      if(state){
-        const fbAtkIsHost=state.attacker==='p1';
-        G.attacker=fbAtkIsHost?2:1;
-        G.p1hits=state.p2hits||0;
-        G.p2hits=state.p1hits||0;
-      }
-      G._guestSynced=false;
-      _doBeginRound();
-    });
-    return;
-  }
-  G._guestSynced=false;
   _doBeginRound();
 }
 
@@ -1295,86 +1300,212 @@ function applyDodgeGrey(){
 }
 function recordAIAttack(dir){G.p2c=dir;document.getElementById('dd2').textContent='✓';document.getElementById('dd2').className='dd chosen';enableGrid('dg1',true);applyDodgeGrey();document.getElementById('aprompt').textContent=G.p2n+' attacked! Pick your dodge!';}
 function startTimer(){phase='choosing';let rem=TIMER_MS;clearInterval(tInt);tInt=setInterval(()=>{rem-=50;if(rem<=0){clearInterval(tInt);onTimeout();}},50);}
-function onTimeout(){if(phase!=='choosing')return;resolveRound(G.p1c,G.p2c);}
+function onTimeout(){
+  if(phase!=='choosing')return;
+  if(isOnlineMode()){
+    // On timeout, use whatever choices exist (null = didn't pick)
+    if(G.onlineRole==='host'){
+      // Host resolves with whatever is available
+      hostResolveOnline(G.p1c, G.p2c);
+    }
+    // Guest just waits — host will write outcome
+    return;
+  }
+  resolveRound(G.p1c,G.p2c);
+}
 
-/* ── ONLINE GAME (Firebase Realtime) ── */
+/* ══ ONLINE GAME (Firebase Realtime) ══
+ *
+ * Protocol (see launchOnlineGame for full spec):
+ *   - Local player is ALWAYS displayed in P1 slot (dg1/dd1/av1)
+ *   - Opponent is ALWAYS in P2 slot (dg2/dd2/av2)
+ *   - G.attacker===1 means LOCAL player attacks this round
+ *   - G.attacker===2 means OPPONENT attacks this round
+ *   - Firebase uses 'host'/'guest' (not 1/2) to avoid perspective confusion
+ *   - Only HOST resolves rounds and writes outcome — guest just reacts
+ */
 function listenOnlineGame(){
   if(!G.onlineCode)return;
   if(gameUnsub){gameUnsub();gameUnsub=null;}
-  const isHost=G.onlineRole==='host';
-  // In Firebase: p1 = host, p2 = guest
-  // Locally on each screen: p1 slot = "me", p2 slot = "opponent"
-  const myFbField=isHost?'p1choice':'p2choice';
-  const oppFbField=isHost?'p2choice':'p1choice';
+  const amHost=G.onlineRole==='host';
+  let lastRound=null;
 
   gameUnsub=fbOn('games/'+G.onlineCode,(state)=>{
+    // ── Opponent quit ──
     if(!state){
-      // Game was deleted — opponent quit
-      if(phase!=='idle'){
-        if(gameUnsub){gameUnsub();gameUnsub=null;}
-        clearTimers();phase='idle';
-        hideOverlay();hideFinPicker();hideDirPicker();
-        document.getElementById('fin-overlay').classList.remove('show');
-        showOverlay('OPPONENT QUIT','Returning to menu...','var(--muted)');
-        setTimeout(()=>{hideOverlay();showScreen('menu-screen');},2000);
-      }
+      if(phase==='idle')return;
+      if(gameUnsub){gameUnsub();gameUnsub=null;}
+      clearTimers();phase='idle';
+      hideOverlay();hideFinPicker();hideDirPicker();
+      document.getElementById('fin-overlay').classList.remove('show');
+      showOverlay('OPPONENT QUIT','Returning to menu...','var(--muted)');
+      setTimeout(()=>{hideOverlay();showScreen('menu-screen');},2200);
       return;
     }
 
-    if(phase==='result'){
-      // Guest watches for host to reset (resolved→false) signaling next round ready
-      if(!isHost&&state.resolved===false&&state.p1choice===null&&state.p2choice===null){
-        // Sync new attacker and hits from Firebase for guest
-        const fbAtkIsHost=state.attacker==='p1';
-        G.attacker=fbAtkIsHost?2:1;
-        G.p1hits=state.p2hits||0; // guest's hits = p2hits in Firebase
-        G.p2hits=state.p1hits||0; // host's hits = p1hits
-        G._guestSynced=true; // skip redundant fbGet in beginRound
-        if(gameUnsub){gameUnsub();gameUnsub=null;}
-        beginRound();
-      }
+    // ── Outcome written — both players show result then begin next round ──
+    if(state.outcome&&state.round!==lastRound){
+      lastRound=state.round;
+      if(phase!=='choosing'&&phase!=='result')return;
+      if(gameUnsub){gameUnsub();gameUnsub=null;}
+      clearTimers();
+
+      const out=state.outcome;
+      // Translate Firebase outcome to local P1/P2 perspective
+      // out.hostHits / out.guestHits are absolute; map to local p1hits/p2hits
+      G.p1hits = amHost ? out.hostHits : out.guestHits;
+      G.p2hits = amHost ? out.guestHits : out.hostHits;
+      // out.nextAttacker: 'host'|'guest' — translate to local 1/2
+      const nextAtk = out.nextAttacker==='host' ? (amHost?1:2) : (amHost?2:1);
+
+      // Local attacker this round: who attacked?
+      const localAtkWasMe = (out.attacker==='host'&&amHost)||(out.attacker==='guest'&&!amHost);
+      // myChoice / oppChoice from Firebase
+      const myFbChoice  = amHost ? out.hostChoice  : out.guestChoice;
+      const oppFbChoice = amHost ? out.guestChoice : out.hostChoice;
+
+      // Locally: if I attacked this round, my choice = p1c (attacker=1), opp = p2c
+      //          if opp attacked, my choice = p1c (dodger) but attacker=2
+      // For resolveRoundDisplay we need p1c=local, p2c=opponent
+      const localP1c = myFbChoice;
+      const localP2c = oppFbChoice;
+
+      // Set attacker for resolveRound (so it knows who attacked)
+      G.attacker = localAtkWasMe ? 1 : 2;
+      G.lastDodgeDir = out.lastDodgeDir||null;
+      G.p1c=localP1c;G.p2c=localP2c;
+
+      // Show result overlay
+      revealAndResolveOnline(localP1c,localP2c,nextAtk,out.hit,out.usedFinId);
       return;
     }
 
     if(phase!=='choosing')return;
 
-    const oppChoice=state[oppFbField];
+    // ── Opponent's choice appeared ──
+    const oppChoice = amHost ? state.guestChoice : state.hostChoice;
     if(oppChoice&&!G.p2c){
       G.p2c=oppChoice;
       document.getElementById('dd2').textContent='✓';
       document.getElementById('dd2').className='dd chosen';
-      if(G.p1c){
-        if(gameUnsub){gameUnsub();gameUnsub=null;}
-        clearInterval(tInt);
-        resolveRound(G.p1c,G.p2c);
+      // Host resolves when both choices are in
+      if(amHost&&G.p1c){
+        hostResolveOnline(G.p1c,G.p2c);
       }
     }
   });
 }
+
 async function submitOnlineChoice(dir){
   if(!G.onlineCode)return;
-  const isHost=G.onlineRole==='host';
-  // Determine which Firebase field we write to based on role
-  // BUT also based on whether we are the attacker or dodger this round
-  // Host=p1 in Firebase, Guest=p2 in Firebase — always
-  const myFbField=isHost?'p1choice':'p2choice';
-  const upd={};upd[myFbField]=dir;upd['ts']=Date.now();
+  const field=G.onlineRole==='host'?'hostChoice':'guestChoice';
+  const upd={[field]:dir,ts:Date.now()};
   await fbUpdate('games/'+G.onlineCode,upd);
+  // If host and guest already chose, resolve immediately
+  if(G.onlineRole==='host'&&G.p2c){
+    hostResolveOnline(dir,G.p2c);
+  }
 }
-async function resetOnlineGame(){
-  if(!G.onlineCode||G.onlineRole!=='host')return; // Only host resets game state
-  // Host is always p1 in Firebase, guest is p2
-  // G.p1hits = local player (host) hits, G.p2hits = opponent (guest) hits
-  const fbAttacker=G.attacker===1?'p1':'p2'; // host local attacker=1 means p1 attacks in Firebase
-  await fbSet('games/'+G.onlineCode,{
+
+// Called only on host when both choices are known
+async function hostResolveOnline(hostLocalChoice,guestLocalChoice){
+  if(phase!=='choosing')return;
+  if(gameUnsub){gameUnsub();gameUnsub=null;}
+  clearTimers();phase='resolving';
+
+  // G.attacker===1 means host attacks; translate to Firebase perspective
+  const fbAttacker = G.attacker===1?'host':'guest';
+  const hostFbChoice = G.onlineRole==='host'?hostLocalChoice:guestLocalChoice;
+  const guestFbChoice= G.onlineRole==='host'?guestLocalChoice:hostLocalChoice;
+
+  // Compute result
+  const ac = G.attacker===1?hostLocalChoice:guestLocalChoice; // attacker choice
+  const dc = G.attacker===1?guestLocalChoice:hostLocalChoice; // dodger choice
+  const usedFin = pendingFin&&pendingFin.dir===ac?pendingFin:null;
+  const isBoom = usedFin?.id==='boom';
+  let hit=false;
+  if(isBoom){hit=true;}
+  else if(!ac){hit=false;}
+  else if(!dc||ac===dc){hit=true;}
+  else{hit=false;}
+
+  // Compute new hits
+  let newHostHits=G.p1hits,newGuestHits=G.p2hits;
+  let nextAttacker=fbAttacker;
+  let lastDodgeDir=null;
+  if(hit){
+    if(isBoom){if(G.attacker===1){newHostHits=WINS;}else{newGuestHits=WINS;}}
+    else{if(G.attacker===1)newHostHits++;else newGuestHits++;}
+    nextAttacker=fbAttacker; // attacker keeps attacking on hit
+  } else {
+    if(G.attacker===1)newHostHits=0;else newGuestHits=0;
+    nextAttacker=fbAttacker==='host'?'guest':'host'; // swap
+    if(dc)lastDodgeDir=dc;
+  }
+  G.streak = hit?G.streak+1:0;
+
+  const outcome={
     attacker:fbAttacker,
-    p1hits:G.p1hits,  // host's hits
-    p2hits:G.p2hits,  // guest's hits
-    p1choice:null,p2choice:null,
-    phase:'choosing',
-    resolved:false,
-    ts:Date.now()
-  });
+    hostChoice:hostFbChoice,
+    guestChoice:guestFbChoice,
+    hostHits:newHostHits,
+    guestHits:newGuestHits,
+    nextAttacker,
+    lastDodgeDir,
+    hit,
+    usedFinId:usedFin?.id||null
+  };
+
+  await fbUpdate('games/'+G.onlineCode,{outcome,round:(await fbGet('games/'+G.onlineCode+'/round')||1)+1});
+}
+
+// Called on both players when outcome is written — shows the result then begins next round
+function revealAndResolveOnline(p1c,p2c,nextAtk,hit,usedFinId){
+  const usedFin=usedFinId?ALL_FINISHERS.find(f=>f.id===usedFinId):null;
+  const isBoom=usedFin?.id==='boom';
+  revealDD(1,p1c,usedFin&&G.attacker===1);revealDD(2,p2c,usedFin&&G.attacker===2);
+  const an=G.attacker===1?G.p1n:G.p2n,dn=G.attacker===1?G.p2n:G.p1n;
+  let big='',sub='';
+  if(isBoom){big='WE BRING THE BOOM!!';sub='Instant knockout!';}
+  else if(!p1c&&!p2c){big='TIME OUT';sub='Nobody moved — roles swap!';}
+  else if(G.attacker===1&&!p1c){big='TIME OUT';sub=an+' was too slow — roles swap!';}
+  else if(G.attacker===2&&!p2c){big='TIME OUT';sub=an+' was too slow — roles swap!';}
+  else if(hit){big=usedFin?'FINISHER!':'HIT!';sub=(usedFin?usedFin.name+' — ':'')+ an+' lands the punch!';}
+  else{big='DODGED!';sub=dn+' slips away!';}
+  const col=hit?(usedFin?'var(--gold)':'var(--red)'):'#7b93ff';
+  showOverlay(big,sub,col);
+  if(hit){
+    const dp=G.attacker===1?2:1;
+    const avEl=document.getElementById('av'+dp);avEl.classList.add('hit-anim','stunned');setTimeout(()=>avEl.classList.remove('hit-anim','stunned'),400);
+    const avR=avEl.getBoundingClientRect();
+    spawnBurst(avR.left+avR.width/2,avR.top+avR.height/2,usedFin?RC(usedFin.rarity):'#e63946',usedFin?20:10);
+    if(G.attacker===2){
+      document.getElementById('dd'+(G.attacker===1?2:1)).className='dd dodge';
+    }
+  } else {
+    document.getElementById('dd'+(G.attacker===1?2:1)).className='dd dodge';
+  }
+  updateHUD();
+
+  const over=G.p1hits>=WINS||G.p2hits>=WINS;
+  phase='result';
+
+  if(hit&&usedFin){
+    rTO=setTimeout(()=>{
+      hideOverlay();
+      const after=()=>{
+        updateHUD();
+        G.attacker=nextAtk;pendingFin=null;
+        rTO=setTimeout(()=>over?endMatch():beginRound(),400);
+      };
+      if(isBoom)showBoom(after);else showFinCinematic(usedFin,after);
+    },400);
+  } else {
+    rTO=setTimeout(()=>{
+      G.attacker=nextAtk;pendingFin=null;
+      over?endMatch():beginRound();
+    },1700);
+  }
 }
 
 /* ── FINISHER PICKER ── */
@@ -1395,6 +1526,21 @@ function pickAnyDir(dir){hideDirPicker();if(pendingFin)pendingFin={...pendingFin
 /* ── INPUT ── */
 function recordChoice(p,dir){
   if(phase!=='choosing')return;
+  // In online mode only P1 slot (local player) can interact — p===1 always
+  if(isOnlineMode()){
+    if(p!==1)return; // ignore P2 grid clicks online (opponent)
+    if(G.p1c)return; // already chose
+    if(G.attacker===2&&dir===G.lastDodgeDir)return; // dodger can't repeat last dodge dir
+    G.p1c=dir;
+    document.querySelectorAll('#dg1 .dbtn').forEach(b=>{if(b.dataset.dir===dir)b.classList.add(G.attacker===1?'sel-atk':'sel-dod');});
+    const isFin=G.attacker===1&&pendingFin&&pendingFin.dir===dir;
+    document.getElementById('dd1').textContent=isFin?'★':'✓';
+    document.getElementById('dd1').className='dd '+(isFin?'finisher':'chosen');
+    enableGrid('dg1',false);
+    submitOnlineChoice(dir);
+    return;
+  }
+  // LOCAL / AI modes below
   if(p===1&&G.p1c)return;if(p===2&&G.p2c)return;
   if(p===1&&G.attacker===2&&dir===G.lastDodgeDir)return;
   if(p===1)G.p1c=dir;else G.p2c=dir;
@@ -1403,17 +1549,9 @@ function recordChoice(p,dir){
     const isFin=pendingFin&&pendingFin.dir===dir;
     document.getElementById('dd'+p).textContent=isFin?'★':'✓';document.getElementById('dd'+p).className='dd '+(isFin?'finisher':'chosen');
     enableGrid('dg'+p,false);
-    if(isOnlineMode()){
-      submitOnlineChoice(dir); // Submit to Firebase; listener will detect opponent's choice
-    }
-    else if(isAIMode()){aiTO=setTimeout(()=>{if(phase!=='choosing')return;const d=aiDodge(dir,G.diff);G.p2c=d;document.querySelectorAll('#dg2 .dbtn').forEach(b=>{if(b.dataset.dir===d)b.classList.add('sel-dod');});clearInterval(tInt);resolveRound(G.p1c,G.p2c);},aiDodgeDelay());}
+    if(isAIMode()){aiTO=setTimeout(()=>{if(phase!=='choosing')return;const d=aiDodge(dir,G.diff);G.p2c=d;document.querySelectorAll('#dg2 .dbtn').forEach(b=>{if(b.dataset.dir===d)b.classList.add('sel-dod');});clearInterval(tInt);resolveRound(G.p1c,G.p2c);},aiDodgeDelay());}
   } else if(p!==G.attacker&&G.attacker===2){
-    if(isOnlineMode()){
-      submitOnlineChoice(dir); // Submit dodge to Firebase
-      // Listener will fire when host (attacker) also submits
-    } else {
-      if(gameUnsub){gameUnsub();gameUnsub=null;}clearInterval(tInt);resolveRound(G.p1c,G.p2c);
-    }
+    if(gameUnsub){gameUnsub();gameUnsub=null;}clearInterval(tInt);resolveRound(G.p1c,G.p2c);
     return;
   }
   if(G.mode==='local'){const ac=G.attacker===1?G.p1c:G.p2c,dc=G.attacker===1?G.p2c:G.p1c;if(ac&&dc){clearInterval(tInt);resolveRound(G.p1c,G.p2c);}}
@@ -1423,8 +1561,9 @@ function aiDodge(atkDir,diff){const r=Math.random();if(diff===1)return r<.85?atk
 function aiAtkDelay(){const d=G.diff;return d>=4?70+Math.random()*90:{1:1600,2:1200,3:900}[d]+Math.random()*500;}
 function aiDodgeDelay(){const d=G.diff;return d>=4?40+Math.random()*60:{1:850,2:650,3:450}[d]+Math.random()*350;}
 
-/* ── RESOLVE ── */
+/* ── RESOLVE (local/AI only — online uses revealAndResolveOnline) ── */
 function resolveRound(p1c,p2c){
+  if(isOnlineMode())return;
   phase='result';clearTimers();if(gameUnsub){gameUnsub();gameUnsub=null;}
   const ac=G.attacker===1?p1c:p2c,dc=G.attacker===1?p2c:p1c;
   const an=G.attacker===1?G.p1n:G.p2n,dn=G.attacker===1?G.p2n:G.p1n;
@@ -1449,22 +1588,14 @@ function resolveRound(p1c,p2c){
     spawnBurst(avR.left+avR.width/2,avR.top+avR.height/2,usedFin?RC(usedFin.rarity):'#e63946',usedFin?20:10);
   } else {
     G.streak=0;if(G.attacker===1)G.p1hits=0;else G.p2hits=0;
-    if(G.attacker===2&&dc)G.lastDodgeDir=dc;
-    G.attacker=dp;document.getElementById('dd'+dp).className='dd dodge';
+    if(dc)G.lastDodgeDir=dc;
+    G.attacker=dp;
+    document.getElementById('dd'+dp).className='dd dodge';
   }
   pendingFin=null;updateHUD();
-  // Reset online game state for next round
-  if(isOnlineMode()&&G.onlineCode){
-    if(G.onlineRole==='host'){
-      // Mark resolved so guest knows result happened, then after delay write fresh round state
-      fbUpdate('games/'+G.onlineCode,{resolved:true}).then(()=>{
-        setTimeout(()=>resetOnlineGame(),400);
-      });
-    }
-  }
   const over=G.p1hits>=WINS||G.p2hits>=WINS;
   if(hit&&usedFin){rTO=setTimeout(()=>{hideOverlay();if(isBoom)showBoom(()=>{updateHUD();rTO=setTimeout(()=>over?endMatch():beginRound(),400);});else showFinCinematic(usedFin,()=>{updateHUD();rTO=setTimeout(()=>over?endMatch():beginRound(),400);});},400);}
-  else{rTO=setTimeout(()=>{if(!hit&&G.attacker===2)G.lastDodgeDir=null;over?endMatch():beginRound();},1700);}
+  else{rTO=setTimeout(()=>{if(!hit)G.lastDodgeDir=null;over?endMatch():beginRound();},1700);}
 }
 
 /* ── CINEMATICS ── */
@@ -1518,7 +1649,7 @@ async function endMatch(){
     }
     await saveCU();updateMenuRankChip();
   }
-  if(G.onlineCode){fbRemove('games/'+G.onlineCode);fbRemove('rooms/'+G.onlineCode);}
+  if(G.onlineCode){try{fbRemove('games/'+G.onlineCode);fbRemove('rooms/'+G.onlineCode);}catch(e){}}
   document.getElementById('bux-earned').textContent=buxMsg;document.getElementById('tok-earned').textContent=tokMsg;document.getElementById('rp-earned').textContent=rpMsg;
   showScreen('gameover-screen');
   if(promotedRank)setTimeout(()=>showRankUpModal(promotedRank,()=>{}),600);
